@@ -8,6 +8,7 @@ interface Room {
   createdAt: number;
   lastActivity: number;
   emptySince?: number; // 记录房间开始为空的时间
+  participantCount: number; // 当前房间人数
 }
 
 // 信令消息类型
@@ -35,16 +36,29 @@ function generateRoomId(): string {
 
 // 检查房间是否为空
 function isRoomEmpty(room: Room): boolean {
-  return (
-    room.creator.readyState !== WebSocket.OPEN &&
-    (!room.joiner || room.joiner.readyState !== WebSocket.OPEN)
-  );
+  return room.participantCount === 0;
+}
+
+// 更新房间人数
+function updateRoomParticipantCount(room: Room) {
+  let count = 0;
+  if (room.creator.readyState === WebSocket.OPEN) {
+    count++;
+  }
+  if (room.joiner && room.joiner.readyState === WebSocket.OPEN) {
+    count++;
+  }
+  room.participantCount = count;
+  console.log(`房间 ${room.id} 当前人数: ${count}`);
 }
 
 // 清理过期房间
 function cleanupExpiredRooms() {
   const now = Date.now();
   for (const [roomId, room] of rooms.entries()) {
+    // 更新房间人数
+    updateRoomParticipantCount(room);
+    
     if (isRoomEmpty(room)) {
       // 如果房间为空，检查是否已经超过空房间超时时间
       const emptySince = room.emptySince || room.lastActivity;
@@ -128,17 +142,16 @@ function handleCreateRoom(socket: WebSocket) {
     id: roomId,
     creator: socket,
     createdAt: Date.now(),
-    lastActivity: Date.now()
+    lastActivity: Date.now(),
+    participantCount: 1 // 创建者初始人数为1
   });
   
-  console.log(`创建新房间: ${roomId}`);
+  console.log(`创建新房间: ${roomId}，当前人数: 1`);
   
   socket.send(JSON.stringify({
     type: "room_created",
     roomId: roomId
   }));
-  
-  // 移除了原来的30秒超时逻辑，现在房间会一直存在直到没人10分钟后才过期
 }
 
 // 处理加入房间
@@ -166,8 +179,10 @@ function handleJoinRoom(socket: WebSocket, roomId: string) {
   room.lastActivity = Date.now();
   // 房间不再为空，重置emptySince
   room.emptySince = undefined;
+  // 更新房间人数
+  updateRoomParticipantCount(room);
   
-  console.log(`用户加入房间: ${roomId}`);
+  console.log(`用户加入房间: ${roomId}，当前人数: ${room.participantCount}`);
   
   // 通知加入者加入成功
   socket.send(JSON.stringify({
@@ -177,7 +192,8 @@ function handleJoinRoom(socket: WebSocket, roomId: string) {
   // 通知房主有用户加入
   if (room.creator.readyState === WebSocket.OPEN) {
     room.creator.send(JSON.stringify({
-      type: "peer_joined"
+      type: "peer_joined",
+      participantCount: room.participantCount
     }));
   }
 }
@@ -231,14 +247,22 @@ function handleWebSocket(req: Request): Promise<Response> {
 
   socket.onclose = () => {
     console.log("WebSocket 连接已关闭");
-    // 清理断开连接的用户所在的房间
+    
+    // 查找并更新用户所在的房间
     for (const [roomId, room] of rooms.entries()) {
       if (room.creator === socket || room.joiner === socket) {
+        // 更新房间人数
+        const previousCount = room.participantCount;
+        updateRoomParticipantCount(room);
+        
+        console.log(`用户断开连接，房间 ${roomId} 人数从 ${previousCount} 变为 ${room.participantCount}`);
+        
         // 通知另一方用户断开连接
         const otherUser = room.creator === socket ? room.joiner : room.creator;
         if (otherUser && otherUser.readyState === WebSocket.OPEN) {
           otherUser.send(JSON.stringify({
-            type: "peer_disconnected"
+            type: "peer_disconnected",
+            participantCount: room.participantCount
           }));
         }
         
@@ -280,6 +304,7 @@ function handleHttp(req: Request): Response {
       createdAt: room.createdAt,
       lastActivity: room.lastActivity,
       hasJoiner: !!room.joiner,
+      participantCount: room.participantCount,
       isEmpty: isRoomEmpty(room),
       emptySince: room.emptySince
     }));
