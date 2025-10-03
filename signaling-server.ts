@@ -1,3 +1,5 @@
+// signaling-server.ts 的修改版本
+
 // 房间管理接口
 interface Room {
   id: string;
@@ -16,10 +18,10 @@ interface SignalingMessage {
   error?: string;
 }
 
-// 存储房间信息（在 Deno Deploy 中，使用内存存储，适合短期场景）
+// 存储房间信息
 const rooms = new Map<string, Room>();
-const ROOM_TIMEOUT = 30 * 1000; // 30秒房间超时
-const CLEANUP_INTERVAL = 10 * 1000; // 10秒清理一次过期房间
+const ROOM_TIMEOUT = 30 * 1000;
+const CLEANUP_INTERVAL = 10 * 1000;
 
 // 生成6位数字房间号
 function generateRoomId(): string {
@@ -49,59 +51,6 @@ function cleanupExpiredRooms() {
 
 // 定期清理任务
 setInterval(cleanupExpiredRooms, CLEANUP_INTERVAL);
-
-// WebSocket 连接处理
-export async function handleWebSocket(req: Request): Promise<Response> {
-  const upgrade = req.headers.get("upgrade") || "";
-  if (upgrade.toLowerCase() != "websocket") {
-    return new Response("请求需要升级为 WebSocket", { status: 426 });
-  }
-
-  const { socket, response } = Deno.upgradeWebSocket(req);
-
-  socket.onopen = () => {
-    console.log("WebSocket 连接已建立");
-  };
-
-  socket.onmessage = (event) => {
-    try {
-      const message: SignalingMessage = JSON.parse(event.data);
-      handleSignalingMessage(socket, message);
-    } catch (error) {
-      console.error("消息解析错误:", error);
-      socket.send(JSON.stringify({
-        type: "error",
-        error: "无效的消息格式"
-      }));
-    }
-  };
-
-  socket.onclose = () => {
-    console.log("WebSocket 连接已关闭");
-    // 清理断开连接的用户所在的房间
-    for (const [roomId, room] of rooms.entries()) {
-      if (room.creator === socket || room.joiner === socket) {
-        // 通知另一方用户断开连接
-        const otherUser = room.creator === socket ? room.joiner : room.creator;
-        if (otherUser && otherUser.readyState === WebSocket.OPEN) {
-          otherUser.send(JSON.stringify({
-            type: "peer_disconnected"
-          }));
-        }
-        
-        rooms.delete(roomId);
-        console.log(`房间 ${roomId} 已清理`);
-        break;
-      }
-    }
-  };
-
-  socket.onerror = (error) => {
-    console.error("WebSocket 错误:", error);
-  };
-
-  return response;
-}
 
 // 处理信令消息
 function handleSignalingMessage(socket: WebSocket, message: SignalingMessage) {
@@ -256,8 +205,61 @@ function forwardToPeer(sender: WebSocket, roomId: string, message: any) {
   }
 }
 
+// WebSocket 连接处理
+function handleWebSocket(req: Request): Promise<Response> {
+  const upgrade = req.headers.get("upgrade") || "";
+  if (upgrade.toLowerCase() !== "websocket") {
+    return Promise.resolve(new Response("请求需要升级为 WebSocket", { status: 426 }));
+  }
+
+  const { socket, response } = Deno.upgradeWebSocket(req);
+
+  socket.onopen = () => {
+    console.log("WebSocket 连接已建立");
+  };
+
+  socket.onmessage = (event) => {
+    try {
+      const message: SignalingMessage = JSON.parse(event.data);
+      handleSignalingMessage(socket, message);
+    } catch (error) {
+      console.error("消息解析错误:", error);
+      socket.send(JSON.stringify({
+        type: "error",
+        error: "无效的消息格式"
+      }));
+    }
+  };
+
+  socket.onclose = () => {
+    console.log("WebSocket 连接已关闭");
+    // 清理断开连接的用户所在的房间
+    for (const [roomId, room] of rooms.entries()) {
+      if (room.creator === socket || room.joiner === socket) {
+        // 通知另一方用户断开连接
+        const otherUser = room.creator === socket ? room.joiner : room.creator;
+        if (otherUser && otherUser.readyState === WebSocket.OPEN) {
+          otherUser.send(JSON.stringify({
+            type: "peer_disconnected"
+          }));
+        }
+        
+        rooms.delete(roomId);
+        console.log(`房间 ${roomId} 已清理`);
+        break;
+      }
+    }
+  };
+
+  socket.onerror = (error) => {
+    console.error("WebSocket 错误:", error);
+  };
+
+  return Promise.resolve(response);
+}
+
 // HTTP 请求处理（用于健康检查）
-export function handleHttp(req: Request): Response {
+function handleHttp(req: Request): Response {
   const url = new URL(req.url);
   
   if (url.pathname === "/health") {
@@ -294,8 +296,15 @@ export function handleHttp(req: Request): Response {
 // 主请求处理函数
 export function handleRequest(req: Request): Response {
   if (req.headers.get("upgrade") === "websocket") {
-    return handleWebSocket(req);
+    // 注意：这里需要返回Promise<Response>，但handleRequest返回Response
+    // 我们需要调整这个函数的返回类型或实现方式
+    return handleWebSocket(req) as unknown as Response;
   } else {
     return handleHttp(req);
   }
 }
+
+// 默认导出对象，包含fetch方法
+export default {
+  fetch: handleRequest,
+};
