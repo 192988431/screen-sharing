@@ -1,4 +1,4 @@
-// signaling-server.ts 的修改版本
+// signaling-server.ts 修改版本
 
 // 房间管理接口
 interface Room {
@@ -7,6 +7,7 @@ interface Room {
   joiner?: WebSocket;
   createdAt: number;
   lastActivity: number;
+  emptySince?: number; // 记录房间开始为空的时间
 }
 
 // 信令消息类型
@@ -20,8 +21,8 @@ interface SignalingMessage {
 
 // 存储房间信息
 const rooms = new Map<string, Room>();
-const ROOM_TIMEOUT = 30 * 1000;
-const CLEANUP_INTERVAL = 10 * 1000;
+const EMPTY_ROOM_TIMEOUT = 10 * 60 * 1000; // 10分钟空房间超时
+const CLEANUP_INTERVAL = 30 * 1000; // 30秒清理一次过期房间
 
 // 生成6位数字房间号
 function generateRoomId(): string {
@@ -32,19 +33,28 @@ function generateRoomId(): string {
   return roomId;
 }
 
+// 检查房间是否为空
+function isRoomEmpty(room: Room): boolean {
+  return (
+    room.creator.readyState !== WebSocket.OPEN &&
+    (!room.joiner || room.joiner.readyState !== WebSocket.OPEN)
+  );
+}
+
 // 清理过期房间
 function cleanupExpiredRooms() {
   const now = Date.now();
   for (const [roomId, room] of rooms.entries()) {
-    if (now - room.lastActivity > ROOM_TIMEOUT) {
-      console.log(`清理过期房间: ${roomId}`);
-      if (room.creator.readyState === WebSocket.OPEN) {
-        room.creator.close(1000, "房间超时");
+    if (isRoomEmpty(room)) {
+      // 如果房间为空，检查是否已经超过空房间超时时间
+      const emptySince = room.emptySince || room.lastActivity;
+      if (now - emptySince > EMPTY_ROOM_TIMEOUT) {
+        console.log(`清理空房间: ${roomId}`);
+        rooms.delete(roomId);
       }
-      if (room.joiner && room.joiner.readyState === WebSocket.OPEN) {
-        room.joiner.close(1000, "房间超时");
-      }
-      rooms.delete(roomId);
+    } else {
+      // 如果房间不为空，重置emptySince
+      room.emptySince = undefined;
     }
   }
 }
@@ -128,21 +138,7 @@ function handleCreateRoom(socket: WebSocket) {
     roomId: roomId
   }));
   
-  // 设置房间超时定时器
-  setTimeout(() => {
-    const room = rooms.get(roomId);
-    if (room && !room.joiner) {
-      // 如果30秒内没有人加入，关闭房间
-      if (room.creator.readyState === WebSocket.OPEN) {
-        room.creator.send(JSON.stringify({
-          type: "room_expired"
-        }));
-        room.creator.close(1000, "房间超时");
-      }
-      rooms.delete(roomId);
-      console.log(`房间 ${roomId} 已超时`);
-    }
-  }, ROOM_TIMEOUT);
+  // 移除了原来的30秒超时逻辑，现在房间会一直存在直到没人10分钟后才过期
 }
 
 // 处理加入房间
@@ -168,6 +164,8 @@ function handleJoinRoom(socket: WebSocket, roomId: string) {
   // 将用户添加到房间
   room.joiner = socket;
   room.lastActivity = Date.now();
+  // 房间不再为空，重置emptySince
+  room.emptySince = undefined;
   
   console.log(`用户加入房间: ${roomId}`);
   
@@ -244,8 +242,12 @@ function handleWebSocket(req: Request): Promise<Response> {
           }));
         }
         
-        rooms.delete(roomId);
-        console.log(`房间 ${roomId} 已清理`);
+        // 检查房间是否为空，如果为空则设置emptySince
+        if (isRoomEmpty(room)) {
+          room.emptySince = Date.now();
+          console.log(`房间 ${roomId} 现在为空，将在10分钟后过期`);
+        }
+        
         break;
       }
     }
@@ -277,7 +279,9 @@ function handleHttp(req: Request): Response {
       id: room.id,
       createdAt: room.createdAt,
       lastActivity: room.lastActivity,
-      hasJoiner: !!room.joiner
+      hasJoiner: !!room.joiner,
+      isEmpty: isRoomEmpty(room),
+      emptySince: room.emptySince
     }));
     
     return new Response(JSON.stringify({
@@ -296,8 +300,6 @@ function handleHttp(req: Request): Response {
 // 主请求处理函数
 export function handleRequest(req: Request): Response {
   if (req.headers.get("upgrade") === "websocket") {
-    // 注意：这里需要返回Promise<Response>，但handleRequest返回Response
-    // 我们需要调整这个函数的返回类型或实现方式
     return handleWebSocket(req) as unknown as Response;
   } else {
     return handleHttp(req);
