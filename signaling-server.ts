@@ -253,23 +253,41 @@ function handleWebSocket(req: Request): Promise<Response> {
       if (room.creator === socket || room.joiner === socket) {
         // 更新房间人数
         const previousCount = room.participantCount;
-        updateRoomParticipantCount(room);
         
-        console.log(`用户断开连接，房间 ${roomId} 人数从 ${previousCount} 变为 ${room.participantCount}`);
-        
-        // 通知另一方用户断开连接
-        const otherUser = room.creator === socket ? room.joiner : room.creator;
-        if (otherUser && otherUser.readyState === WebSocket.OPEN) {
-          otherUser.send(JSON.stringify({
-            type: "peer_disconnected",
-            participantCount: room.participantCount
-          }));
-        }
-        
-        // 检查房间是否为空，如果为空则设置emptySince
-        if (isRoomEmpty(room)) {
-          room.emptySince = Date.now();
-          console.log(`房间 ${roomId} 现在为空，将在10分钟后过期`);
+        // 清除断开用户的引用
+        if (room.creator === socket) {
+          console.log(`房主断开连接，房间 ${roomId}`);
+          // 如果房主断开，可以考虑直接删除房间或将joiner提升为房主
+          // 这里选择直接删除房间
+          if (room.joiner && room.joiner.readyState === WebSocket.OPEN) {
+            room.joiner.send(JSON.stringify({
+              type: "peer_disconnected",
+              participantCount: 0
+            }));
+          }
+          rooms.delete(roomId);
+          console.log(`房间 ${roomId} 已删除（房主断开）`);
+        } else if (room.joiner === socket) {
+          console.log(`协助端断开连接，房间 ${roomId}`);
+          // 清除joiner引用
+          room.joiner = undefined;
+          updateRoomParticipantCount(room);
+          
+          console.log(`用户断开连接，房间 ${roomId} 人数从 ${previousCount} 变为 ${room.participantCount}`);
+          
+          // 通知房主用户断开连接
+          if (room.creator.readyState === WebSocket.OPEN) {
+            room.creator.send(JSON.stringify({
+              type: "peer_disconnected",
+              participantCount: room.participantCount
+            }));
+          }
+          
+          // 检查房间是否为空，如果为空则设置emptySince
+          if (isRoomEmpty(room)) {
+            room.emptySince = Date.now();
+            console.log(`房间 ${roomId} 现在为空，将在10分钟后过期`);
+          }
         }
         
         break;
