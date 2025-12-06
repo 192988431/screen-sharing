@@ -144,14 +144,16 @@ async function handleJoinRoom(socket: WebSocket, roomId: string) {
       type: "peer_joined",
       participantCount: 2
     }));
-    console.log(`[${INSTANCE_ID}] 📤 已通知创建者`);
+    console.log(`[${INSTANCE_ID}] 📤 已通知创建者（同实例）`);
   } else {
-    // 创建者在另一个实例，使用 Redis Pub/Sub
-    await redis.publish(`room:${roomId}:events`, JSON.stringify({
+    // 创建者在另一个实例，将消息存储到 Redis
+    const messageKey = `room:${roomId}:pending:${Date.now()}`;
+    await redis.set(messageKey, JSON.stringify({
       type: "peer_joined",
-      participantCount: 2
-    }));
-    console.log(`[${INSTANCE_ID}] 📤 已通过 Redis 发布事件`);
+      participantCount: 2,
+      targetRole: "creator"
+    }), { ex: 60 }); // 1分钟过期
+    console.log(`[${INSTANCE_ID}] 📤 已将消息存储到 Redis: ${messageKey}`);
   }
 }
 
@@ -180,8 +182,14 @@ async function forwardToPeer(sender: WebSocket, roomId: string, message: any) {
   if (target && target.readyState === WebSocket.OPEN) {
     target.send(JSON.stringify(message));
   } else {
-    // 对等方在另一个实例，使用 Redis Pub/Sub
-    await redis.publish(`room:${roomId}:messages`, JSON.stringify(message));
+    // 对等方在另一个实例，将消息存储到 Redis
+    const messageKey = `room:${roomId}:pending:${Date.now()}`;
+    const targetRole = sender === conn?.creator ? "joiner" : "creator";
+    await redis.set(messageKey, JSON.stringify({
+      ...message,
+      targetRole
+    }), { ex: 60 }); // 1分钟过期
+    console.log(`[${INSTANCE_ID}] 📤 已将消息存储到 Redis 给 ${targetRole}`);
   }
 }
 
@@ -234,8 +242,50 @@ function handleWebSocket(req: Request): Response {
 
   const { socket, response } = Deno.upgradeWebSocket(req);
 
+  // 轮询检查待发送消息的定时器
+  let pollInterval: number | undefined;
+  
   socket.onopen = () => {
     console.log(`[${INSTANCE_ID}] 🔌 WebSocket 连接已建立`);
+    
+    // 启动轮询检查待发送消息（每2秒检查一次）
+    pollInterval = setInterval(async () => {
+      try {
+        // 查找此连接所在的房间
+        for (const [roomId, conn] of connections.entries()) {
+          if (conn.creator === socket || conn.joiner === socket) {
+            const role = conn.creator === socket ? "creator" : "joiner";
+            
+            // 获取所有待发送消息
+            const keys = await redis.keys(`room:${roomId}:pending:*`);
+            
+            for (const key of keys) {
+              const msgData = await redis.get(key);
+              if (msgData) {
+                const msg = typeof msgData === 'string' ? JSON.parse(msgData) : msgData;
+                
+                // 检查消息是否是发给当前连接的
+                if (msg.targetRole === role) {
+                  // 发送消息
+                  if (socket.readyState === WebSocket.OPEN) {
+                    const { targetRole, ...messageToSend } = msg;
+                    socket.send(JSON.stringify(messageToSend));
+                    console.log(`[${INSTANCE_ID}] 📨 已发送跨实例消息给 ${role}: ${msg.type}`);
+                  }
+                  
+                  // 删除已发送的消息
+                  await redis.del(key);
+                }
+              }
+            }
+            
+            break;
+          }
+        }
+      } catch (error) {
+        console.error(`[${INSTANCE_ID}] 轮询消息错误:`, error);
+      }
+    }, 2000); // 每2秒检查一次
   };
 
   socket.onmessage = async (event) => {
@@ -249,6 +299,11 @@ function handleWebSocket(req: Request): Response {
 
   socket.onclose = async () => {
     console.log(`[${INSTANCE_ID}] 🔌 WebSocket 连接已关闭`);
+    
+    // 停止轮询
+    if (pollInterval) {
+      clearInterval(pollInterval);
+    }
     
     // 清理连接
     for (const [roomId, conn] of connections.entries()) {
