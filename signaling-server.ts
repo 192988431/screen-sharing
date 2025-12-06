@@ -49,26 +49,17 @@ function updateRoomParticipantCount(room: Room) {
     count++;
   }
   room.participantCount = count;
-  console.log(`房间 ${room.id} 当前人数: ${count}`);
+  console.log(`房间 ${room.id} 当前人数: ${count} (creator: ${room.creator.readyState}, joiner: ${room.joiner?.readyState || 'N/A'})`);
 }
 
 // 清理过期房间
 function cleanupExpiredRooms() {
   const now = Date.now();
   for (const [roomId, room] of rooms.entries()) {
-    // 更新房间人数
-    updateRoomParticipantCount(room);
-    
-    if (isRoomEmpty(room)) {
-      // 如果房间为空，检查是否已经超过空房间超时时间
-      const emptySince = room.emptySince || room.lastActivity;
-      if (now - emptySince > EMPTY_ROOM_TIMEOUT) {
-        console.log(`清理空房间: ${roomId}`);
-        rooms.delete(roomId);
-      }
-    } else {
-      // 如果房间不为空，重置emptySince
-      room.emptySince = undefined;
+    // 只清理已经标记为空的房间
+    if (room.emptySince && now - room.emptySince > EMPTY_ROOM_TIMEOUT) {
+      console.log(`清理空房间: ${roomId} (空闲时间: ${Math.floor((now - room.emptySince) / 1000)}秒)`);
+      rooms.delete(roomId);
     }
   }
 }
