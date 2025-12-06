@@ -60,7 +60,6 @@ async function cleanupExpiredRooms() {
   for (const key of keys) {
     const room = await redis.get<Room>(key);
     if (room && room.emptySince && now - room.emptySince > EMPTY_ROOM_TIMEOUT) {
-      console.log(`[${INSTANCE_ID}] 清理空房间: ${room.id}`);
       await redis.del(key);
     }
   }
@@ -94,7 +93,6 @@ async function handleCreateRoom(socket: WebSocket) {
 
 // 处理加入房间
 async function handleJoinRoom(socket: WebSocket, roomId: string) {
-  console.log(`[${INSTANCE_ID}] 📥 收到加入房间请求: ${roomId}`);
   
   const roomData = await redis.get(`room:${roomId}`);
   
@@ -109,10 +107,7 @@ async function handleJoinRoom(socket: WebSocket, roomId: string) {
   
   const room: Room = typeof roomData === 'string' ? JSON.parse(roomData) : roomData;
   
-  console.log(`[${INSTANCE_ID}] ✅ 找到房间: ${roomId} (创建实例: ${room.creatorInstanceId})`);
-  
   if (room.participantCount >= 2) {
-    console.warn(`[${INSTANCE_ID}] ⚠️ 房间已满: ${roomId}`);
     socket.send(JSON.stringify({
       type: "error",
       error: "房间已满"
@@ -131,8 +126,6 @@ async function handleJoinRoom(socket: WebSocket, roomId: string) {
   conn.joiner = socket;
   connections.set(roomId, conn);
   
-  console.log(`[${INSTANCE_ID}] ✅ 用户成功加入房间: ${roomId}`);
-  
   // 通知加入者
   socket.send(JSON.stringify({
     type: "join_success"
@@ -144,7 +137,6 @@ async function handleJoinRoom(socket: WebSocket, roomId: string) {
       type: "peer_joined",
       participantCount: 2
     }));
-    console.log(`[${INSTANCE_ID}] 📤 已通知创建者（同实例）`);
   } else {
     // 创建者在另一个实例，将消息存储到 Redis
     const messageKey = `room:${roomId}:pending:${Date.now()}`;
@@ -153,7 +145,6 @@ async function handleJoinRoom(socket: WebSocket, roomId: string) {
       participantCount: 2,
       targetRole: "creator"
     }), { ex: 60 }); // 1分钟过期
-    console.log(`[${INSTANCE_ID}] 📤 已将消息存储到 Redis: ${messageKey}`);
   }
 }
 
@@ -189,13 +180,11 @@ async function forwardToPeer(sender: WebSocket, roomId: string, message: any) {
       ...message,
       targetRole
     }), { ex: 60 }); // 1分钟过期
-    console.log(`[${INSTANCE_ID}] 📤 已将消息存储到 Redis 给 ${targetRole}`);
   }
 }
 
 // 处理信令消息
 async function handleSignalingMessage(socket: WebSocket, message: SignalingMessage) {
-  console.log(`[${INSTANCE_ID}] 📨 收到消息: type=${message.type}`);
   
   switch (message.type) {
     case "create_room":
@@ -270,7 +259,6 @@ function handleWebSocket(req: Request): Response {
                   if (socket.readyState === WebSocket.OPEN) {
                     const { targetRole, ...messageToSend } = msg;
                     socket.send(JSON.stringify(messageToSend));
-                    console.log(`[${INSTANCE_ID}] 📨 已发送跨实例消息给 ${role}: ${msg.type}`);
                   }
                   
                   // 删除已发送的消息
