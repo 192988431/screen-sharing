@@ -1,15 +1,16 @@
-// signaling-server.ts 修改版本
+// signaling-server-redis.ts - 使用 Redis 解决多实例问题
+// 需要设置环境变量: UPSTASH_REDIS_REST_URL 和 UPSTASH_REDIS_REST_TOKEN
+
+import { Redis } from "https://esm.sh/@upstash/redis@1.28.0";
 
 // 房间管理接口
 interface Room {
   id: string;
-  creator: WebSocket;
-  joiner?: WebSocket;
   createdAt: number;
   lastActivity: number;
-  emptySince?: number; // 记录房间开始为空的时间
-  participantCount: number; // 当前房间人数
-  creatorInstanceId: string; // 创建者所在实例ID
+  emptySince?: number;
+  participantCount: number;
+  creatorInstanceId: string;
 }
 
 // 信令消息类型
@@ -21,50 +22,46 @@ interface SignalingMessage {
   error?: string;
 }
 
-// 生成实例ID（用于调试多实例问题）
+// 生成实例ID
 const INSTANCE_ID = Math.random().toString(36).substring(7);
 console.log(`🚀 信令服务器实例启动: ${INSTANCE_ID}`);
 
-// 存储房间信息
-const rooms = new Map<string, Room>();
-const EMPTY_ROOM_TIMEOUT = 10 * 60 * 1000; // 10分钟空房间超时
-const CLEANUP_INTERVAL = 30 * 1000; // 30秒清理一次过期房间
+// 初始化 Redis 客户端
+const redis = new Redis({
+  url: Deno.env.get("UPSTASH_REDIS_REST_URL") || "",
+  token: Deno.env.get("UPSTASH_REDIS_REST_TOKEN") || "",
+});
+
+// 本地 WebSocket 连接管理
+const connections = new Map<string, { creator?: WebSocket; joiner?: WebSocket }>();
+
+const EMPTY_ROOM_TIMEOUT = 10 * 60 * 1000; // 10分钟
+const CLEANUP_INTERVAL = 30 * 1000; // 30秒
 
 // 生成6位数字房间号
-function generateRoomId(): string {
+async function generateRoomId(): Promise<string> {
   let roomId: string;
-  do {
+  let exists = true;
+  
+  while (exists) {
     roomId = Math.floor(100000 + Math.random() * 900000).toString();
-  } while (rooms.has(roomId));
-  return roomId;
-}
-
-// 检查房间是否为空
-function isRoomEmpty(room: Room): boolean {
-  return room.participantCount === 0;
-}
-
-// 更新房间人数
-function updateRoomParticipantCount(room: Room) {
-  let count = 0;
-  if (room.creator.readyState === WebSocket.OPEN) {
-    count++;
+    const room = await redis.get(`room:${roomId}`);
+    exists = room !== null;
   }
-  if (room.joiner && room.joiner.readyState === WebSocket.OPEN) {
-    count++;
-  }
-  room.participantCount = count;
-  console.log(`[${INSTANCE_ID}] 房间 ${room.id} 当前人数: ${count}`);
+  
+  return roomId!;
 }
 
 // 清理过期房间
-function cleanupExpiredRooms() {
+async function cleanupExpiredRooms() {
   const now = Date.now();
-  for (const [roomId, room] of rooms.entries()) {
-    // 只清理已经标记为空的房间
-    if (room.emptySince && now - room.emptySince > EMPTY_ROOM_TIMEOUT) {
-      console.log(`[${INSTANCE_ID}] 清理空房间: ${roomId} (空闲时间: ${Math.floor((now - room.emptySince) / 1000)}秒)`);
-      rooms.delete(roomId);
+  const keys = await redis.keys("room:*");
+  
+  for (const key of keys) {
+    const room = await redis.get<Room>(key);
+    if (room && room.emptySince && now - room.emptySince > EMPTY_ROOM_TIMEOUT) {
+      console.log(`[${INSTANCE_ID}] 清理空房间: ${room.id}`);
+      await redis.del(key);
     }
   }
 }
@@ -72,90 +69,22 @@ function cleanupExpiredRooms() {
 // 定期清理任务
 setInterval(cleanupExpiredRooms, CLEANUP_INTERVAL);
 
-// 处理信令消息
-function handleSignalingMessage(socket: WebSocket, message: SignalingMessage) {
-  console.log(`[${INSTANCE_ID}] 📨 收到消息: type=${message.type}, roomId=${message.roomId || 'N/A'}`);
-  
-  switch (message.type) {
-    case "create_room":
-      console.log(`[${INSTANCE_ID}] 🏠 处理创建房间请求`);
-      handleCreateRoom(socket);
-      break;
-      
-    case "join_room":
-      console.log(`[${INSTANCE_ID}] 🚪 处理加入房间请求: roomId=${message.roomId}`);
-      if (message.roomId) {
-        handleJoinRoom(socket, message.roomId);
-      } else {
-        console.error(`[${INSTANCE_ID}] ❌ 加入房间请求缺少 roomId`);
-        socket.send(JSON.stringify({
-          type: "error",
-          error: "缺少房间号"
-        }));
-      }
-      break;
-      
-    case "webrtc_offer":
-      if (message.roomId && message.sdp) {
-        forwardToPeer(socket, message.roomId, {
-          type: "webrtc_offer",
-          sdp: message.sdp
-        });
-      }
-      break;
-      
-    case "webrtc_answer":
-      if (message.roomId && message.sdp) {
-        forwardToPeer(socket, message.roomId, {
-          type: "webrtc_answer", 
-          sdp: message.sdp
-        });
-      }
-      break;
-      
-    case "ice_candidate":
-      if (message.roomId && message.candidate) {
-        forwardToPeer(socket, message.roomId, {
-          type: "ice_candidate",
-          candidate: message.candidate
-        });
-      }
-      break;
-      
-    case "keepalive":
-      // 更新房间活动时间
-      for (const room of rooms.values()) {
-        if (room.creator === socket || room.joiner === socket) {
-          room.lastActivity = Date.now();
-          break;
-        }
-      }
-      break;
-      
-    default:
-      socket.send(JSON.stringify({
-        type: "error",
-        error: "未知的消息类型"
-      }));
-  }
-}
-
 // 处理创建房间
-function handleCreateRoom(socket: WebSocket) {
-  const roomId = generateRoomId();
+async function handleCreateRoom(socket: WebSocket) {
+  const roomId = await generateRoomId();
   
-  rooms.set(roomId, {
+  const room: Room = {
     id: roomId,
-    creator: socket,
     createdAt: Date.now(),
     lastActivity: Date.now(),
     participantCount: 1,
     creatorInstanceId: INSTANCE_ID
-  });
+  };
   
-  console.log(`[${INSTANCE_ID}] ✅ 创建新房间: ${roomId}，当前人数: 1`);
-  console.log(`[${INSTANCE_ID}] 📊 房间已保存到 Map，当前总房间数: ${rooms.size}`);
-  console.log(`[${INSTANCE_ID}] 📊 所有房间: ${Array.from(rooms.keys()).join(', ')}`);
+  await redis.set(`room:${roomId}`, JSON.stringify(room), { ex: 600 }); // 10分钟过期
+  connections.set(roomId, { creator: socket });
+  
+  console.log(`[${INSTANCE_ID}] ✅ 创建新房间: ${roomId}`);
   
   socket.send(JSON.stringify({
     type: "room_created",
@@ -164,16 +93,13 @@ function handleCreateRoom(socket: WebSocket) {
 }
 
 // 处理加入房间
-function handleJoinRoom(socket: WebSocket, roomId: string) {
+async function handleJoinRoom(socket: WebSocket, roomId: string) {
   console.log(`[${INSTANCE_ID}] 📥 收到加入房间请求: ${roomId}`);
-  console.log(`[${INSTANCE_ID}] 📊 当前房间列表: ${Array.from(rooms.keys()).join(', ')}`);
-  console.log(`[${INSTANCE_ID}] 📊 当前房间总数: ${rooms.size}`);
   
-  const room = rooms.get(roomId);
+  const roomData = await redis.get(`room:${roomId}`);
   
-  if (!room) {
+  if (!roomData) {
     console.error(`[${INSTANCE_ID}] ❌ 房间不存在: ${roomId}`);
-    console.log(`[${INSTANCE_ID}] 📋 可用房间: ${Array.from(rooms.keys()).join(', ') || '无'}`);
     socket.send(JSON.stringify({
       type: "error",
       error: "房间不存在"
@@ -181,146 +107,181 @@ function handleJoinRoom(socket: WebSocket, roomId: string) {
     return;
   }
   
-  console.log(`[${INSTANCE_ID}] ✅ 找到房间: ${roomId}`);
-  console.log(`[${INSTANCE_ID}]    - 创建实例: ${room.creatorInstanceId}`);
-  console.log(`[${INSTANCE_ID}]    - 当前实例: ${INSTANCE_ID}`);
-  console.log(`[${INSTANCE_ID}]    - 创建时间: ${new Date(room.createdAt).toISOString()}`);
-  console.log(`[${INSTANCE_ID}]    - 房主状态: ${room.creator.readyState === WebSocket.OPEN ? '在线' : '离线'}`);
-  console.log(`[${INSTANCE_ID}]    - 协助端: ${room.joiner ? '已有' : '空缺'}`);
+  const room: Room = typeof roomData === 'string' ? JSON.parse(roomData) : roomData;
   
-  if (room.joiner) {
+  console.log(`[${INSTANCE_ID}] ✅ 找到房间: ${roomId} (创建实例: ${room.creatorInstanceId})`);
+  
+  if (room.participantCount >= 2) {
     console.warn(`[${INSTANCE_ID}] ⚠️ 房间已满: ${roomId}`);
     socket.send(JSON.stringify({
-      type: "error", 
+      type: "error",
       error: "房间已满"
     }));
     return;
   }
   
-  // 将用户添加到房间
-  room.joiner = socket;
+  // 更新房间信息
+  room.participantCount = 2;
   room.lastActivity = Date.now();
   room.emptySince = undefined;
-  updateRoomParticipantCount(room);
+  await redis.set(`room:${roomId}`, JSON.stringify(room), { ex: 600 });
   
-  console.log(`[${INSTANCE_ID}] ✅ 用户成功加入房间: ${roomId}，当前人数: ${room.participantCount}`);
+  // 保存本地连接
+  const conn = connections.get(roomId) || {};
+  conn.joiner = socket;
+  connections.set(roomId, conn);
   
-  // 通知加入者加入成功
+  console.log(`[${INSTANCE_ID}] ✅ 用户成功加入房间: ${roomId}`);
+  
+  // 通知加入者
   socket.send(JSON.stringify({
     type: "join_success"
   }));
-  console.log(`[${INSTANCE_ID}] 📤 已发送加入成功消息给协助端`);
   
-  // 通知房主有用户加入
-  if (room.creator.readyState === WebSocket.OPEN) {
-    room.creator.send(JSON.stringify({
+  // 通知创建者（如果在同一实例）
+  if (conn.creator && conn.creator.readyState === WebSocket.OPEN) {
+    conn.creator.send(JSON.stringify({
       type: "peer_joined",
-      participantCount: room.participantCount
+      participantCount: 2
     }));
-    console.log(`[${INSTANCE_ID}] 📤 已发送对等端加入消息给主持端`);
+    console.log(`[${INSTANCE_ID}] 📤 已通知创建者`);
   } else {
-    console.log(`[${INSTANCE_ID}] ⚠️ 主持端连接已关闭，无法通知`);
+    // 创建者在另一个实例，使用 Redis Pub/Sub
+    await redis.publish(`room:${roomId}:events`, JSON.stringify({
+      type: "peer_joined",
+      participantCount: 2
+    }));
+    console.log(`[${INSTANCE_ID}] 📤 已通过 Redis 发布事件`);
   }
 }
 
 // 转发消息给对等方
-function forwardToPeer(sender: WebSocket, roomId: string, message: any) {
-  const room = rooms.get(roomId);
-  if (!room) return;
+async function forwardToPeer(sender: WebSocket, roomId: string, message: any) {
+  const conn = connections.get(roomId);
   
-  // 更新房间活动时间
-  room.lastActivity = Date.now();
+  // 更新活动时间
+  const roomData = await redis.get(`room:${roomId}`);
+  if (roomData) {
+    const room: Room = typeof roomData === 'string' ? JSON.parse(roomData) : roomData;
+    room.lastActivity = Date.now();
+    await redis.set(`room:${roomId}`, JSON.stringify(room), { ex: 600 });
+  }
   
   let target: WebSocket | undefined;
   
-  if (sender === room.creator) {
-    target = room.joiner;
-  } else if (sender === room.joiner) {
-    target = room.creator;
+  if (conn) {
+    if (sender === conn.creator) {
+      target = conn.joiner;
+    } else if (sender === conn.joiner) {
+      target = conn.creator;
+    }
   }
   
   if (target && target.readyState === WebSocket.OPEN) {
     target.send(JSON.stringify(message));
+  } else {
+    // 对等方在另一个实例，使用 Redis Pub/Sub
+    await redis.publish(`room:${roomId}:messages`, JSON.stringify(message));
+  }
+}
+
+// 处理信令消息
+async function handleSignalingMessage(socket: WebSocket, message: SignalingMessage) {
+  console.log(`[${INSTANCE_ID}] 📨 收到消息: type=${message.type}`);
+  
+  switch (message.type) {
+    case "create_room":
+      await handleCreateRoom(socket);
+      break;
+      
+    case "join_room":
+      if (message.roomId) {
+        await handleJoinRoom(socket, message.roomId);
+      }
+      break;
+      
+    case "webrtc_offer":
+    case "webrtc_answer":
+    case "ice_candidate":
+      if (message.roomId) {
+        await forwardToPeer(socket, message.roomId, message);
+      }
+      break;
+      
+    case "keepalive":
+      // 更新活动时间
+      for (const [roomId, conn] of connections.entries()) {
+        if (conn.creator === socket || conn.joiner === socket) {
+          const roomData = await redis.get(`room:${roomId}`);
+          if (roomData) {
+            const room: Room = typeof roomData === 'string' ? JSON.parse(roomData) : roomData;
+            room.lastActivity = Date.now();
+            await redis.set(`room:${roomId}`, JSON.stringify(room), { ex: 600 });
+          }
+          break;
+        }
+      }
+      break;
   }
 }
 
 // WebSocket 连接处理
-function handleWebSocket(req: Request): Promise<Response> {
+function handleWebSocket(req: Request): Response {
   const upgrade = req.headers.get("upgrade") || "";
   if (upgrade.toLowerCase() !== "websocket") {
-    return Promise.resolve(new Response("请求需要升级为 WebSocket", { status: 426 }));
+    return new Response("请求需要升级为 WebSocket", { status: 426 });
   }
 
   const { socket, response } = Deno.upgradeWebSocket(req);
 
   socket.onopen = () => {
-    console.log(`[${INSTANCE_ID}] 🔌 WebSocket 连接已建立 (当前房间数: ${rooms.size})`);
+    console.log(`[${INSTANCE_ID}] 🔌 WebSocket 连接已建立`);
   };
 
-  socket.onmessage = (event) => {
-    console.log(`[${INSTANCE_ID}] 📩 收到原始消息: ${event.data}`);
+  socket.onmessage = async (event) => {
     try {
       const message: SignalingMessage = JSON.parse(event.data);
-      console.log(`[${INSTANCE_ID}] ✅ 消息解析成功: type=${message.type}`);
-      handleSignalingMessage(socket, message);
+      await handleSignalingMessage(socket, message);
     } catch (error) {
-      console.error(`[${INSTANCE_ID}] 消息解析错误:`, error);
-      socket.send(JSON.stringify({
-        type: "error",
-        error: "无效的消息格式"
-      }));
+      console.error(`[${INSTANCE_ID}] 消息处理错误:`, error);
     }
   };
 
-  socket.onclose = () => {
-    console.log(`[${INSTANCE_ID}] 🔌 WebSocket 连接已关闭 (关闭前房间数: ${rooms.size})`);
+  socket.onclose = async () => {
+    console.log(`[${INSTANCE_ID}] 🔌 WebSocket 连接已关闭`);
     
-    // 查找并更新用户所在的房间
-    for (const [roomId, room] of rooms.entries()) {
-      if (room.creator === socket || room.joiner === socket) {
-        const previousCount = room.participantCount;
-        
-        // 清除断开用户的引用
-        if (room.creator === socket) {
-          console.log(`[${INSTANCE_ID}] ⚠️ 房主断开连接，房间 ${roomId}`);
-          console.log(`[${INSTANCE_ID}] ⏰ 房间将保留，等待房主重新连接或10分钟后过期`);
+    // 清理连接
+    for (const [roomId, conn] of connections.entries()) {
+      if (conn.creator === socket || conn.joiner === socket) {
+        const roomData = await redis.get(`room:${roomId}`);
+        if (roomData) {
+          const room: Room = typeof roomData === 'string' ? JSON.parse(roomData) : roomData;
           
-          // 通知协助端房主断开（如果有协助端）
-          if (room.joiner && room.joiner.readyState === WebSocket.OPEN) {
-            room.joiner.send(JSON.stringify({
-              type: "peer_disconnected",
-              participantCount: 0
-            }));
+          if (conn.creator === socket) {
+            conn.creator = undefined;
+            room.participantCount--;
+          } else if (conn.joiner === socket) {
+            conn.joiner = undefined;
+            room.participantCount--;
           }
           
-          // 不立即删除房间，而是标记为空并设置过期时间
-          room.emptySince = Date.now();
-          updateRoomParticipantCount(room);
-          
-          console.log(`[${INSTANCE_ID}] ✅ 房间 ${roomId} 已标记为空，将在10分钟后自动清理`);
-          console.log(`[${INSTANCE_ID}] 📊 当前房间总数: ${rooms.size}`);
-        } else if (room.joiner === socket) {
-          console.log(`[${INSTANCE_ID}] ⚠️ 协助端断开连接，房间 ${roomId}`);
-          
-          // 清除joiner引用
-          room.joiner = undefined;
-          updateRoomParticipantCount(room);
-          
-          console.log(`[${INSTANCE_ID}] 用户断开连接，房间 ${roomId} 人数从 ${previousCount} 变为 ${room.participantCount}`);
-          
-          // 通知房主用户断开连接
-          if (room.creator.readyState === WebSocket.OPEN) {
-            room.creator.send(JSON.stringify({
-              type: "peer_disconnected",
-              participantCount: room.participantCount
-            }));
-          }
-          
-          // 检查房间是否为空，如果为空则设置emptySince
-          if (isRoomEmpty(room)) {
+          if (room.participantCount === 0) {
             room.emptySince = Date.now();
-            console.log(`[${INSTANCE_ID}] 房间 ${roomId} 现在为空，将在10分钟后过期`);
           }
+          
+          await redis.set(`room:${roomId}`, JSON.stringify(room), { ex: 600 });
+          
+          // 通知对等方
+          if (conn.creator && conn.creator.readyState === WebSocket.OPEN) {
+            conn.creator.send(JSON.stringify({ type: "peer_disconnected" }));
+          }
+          if (conn.joiner && conn.joiner.readyState === WebSocket.OPEN) {
+            conn.joiner.send(JSON.stringify({ type: "peer_disconnected" }));
+          }
+        }
+        
+        if (!conn.creator && !conn.joiner) {
+          connections.delete(roomId);
         }
         
         break;
@@ -328,14 +289,10 @@ function handleWebSocket(req: Request): Promise<Response> {
     }
   };
 
-  socket.onerror = (error) => {
-    console.error(`[${INSTANCE_ID}] WebSocket 错误:`, error);
-  };
-
-  return Promise.resolve(response);
+  return response;
 }
 
-// HTTP 请求处理（用于健康检查）
+// HTTP 请求处理
 function handleHttp(req: Request): Response {
   const url = new URL(req.url);
   
@@ -343,28 +300,7 @@ function handleHttp(req: Request): Response {
     return new Response(JSON.stringify({
       status: "ok",
       instanceId: INSTANCE_ID,
-      roomCount: rooms.size,
       timestamp: Date.now()
-    }), {
-      headers: { "Content-Type": "application/json" }
-    });
-  }
-  
-  if (url.pathname === "/stats") {
-    const roomList = Array.from(rooms.values()).map(room => ({
-      id: room.id,
-      createdAt: room.createdAt,
-      lastActivity: room.lastActivity,
-      participantCount: room.participantCount,
-      isEmpty: isRoomEmpty(room),
-      emptySince: room.emptySince,
-      creatorInstanceId: room.creatorInstanceId
-    }));
-    
-    return new Response(JSON.stringify({
-      instanceId: INSTANCE_ID,
-      rooms: roomList,
-      totalRooms: rooms.size
     }), {
       headers: { "Content-Type": "application/json" }
     });
@@ -378,13 +314,12 @@ function handleHttp(req: Request): Response {
 // 主请求处理函数
 export function handleRequest(req: Request): Response {
   if (req.headers.get("upgrade") === "websocket") {
-    return handleWebSocket(req) as unknown as Response;
+    return handleWebSocket(req);
   } else {
     return handleHttp(req);
   }
 }
 
-// 默认导出对象，包含fetch方法
 export default {
   fetch: handleRequest,
 };
