@@ -147,7 +147,9 @@ function handleCreateRoom(socket: WebSocket) {
     participantCount: 1 // 创建者初始人数为1
   });
   
-  console.log(`创建新房间: ${roomId}，当前人数: 1`);
+  console.log(`✅ 创建新房间: ${roomId}，当前人数: 1`);
+  console.log(`📊 房间已保存到 Map，当前总房间数: ${rooms.size}`);
+  console.log(`📊 所有房间: ${Array.from(rooms.keys()).join(', ')}`);
   
   socket.send(JSON.stringify({
     type: "room_created",
@@ -252,7 +254,7 @@ function handleWebSocket(req: Request): Promise<Response> {
   const { socket, response } = Deno.upgradeWebSocket(req);
 
   socket.onopen = () => {
-    console.log("WebSocket 连接已建立");
+    console.log(`🔌 WebSocket 连接已建立 (当前房间数: ${rooms.size})`);
   };
 
   socket.onmessage = (event) => {
@@ -271,7 +273,7 @@ function handleWebSocket(req: Request): Promise<Response> {
   };
 
   socket.onclose = () => {
-    console.log("WebSocket 连接已关闭");
+    console.log(`🔌 WebSocket 连接已关闭 (关闭前房间数: ${rooms.size})`);
     
     // 查找并更新用户所在的房间
     for (const [roomId, room] of rooms.entries()) {
@@ -291,7 +293,7 @@ function handleWebSocket(req: Request): Promise<Response> {
             }));
           }
           rooms.delete(roomId);
-          console.log(`房间 ${roomId} 已删除（房主断开）`);
+          console.log(`🗑️ 房间 ${roomId} 已删除（房主断开），剩余房间数: ${rooms.size}`);
         } else if (room.joiner === socket) {
           console.log(`协助端断开连接，房间 ${roomId}`);
           // 清除joiner引用
