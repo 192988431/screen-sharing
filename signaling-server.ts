@@ -3,10 +3,13 @@
 // 房间管理接口
 interface Room {
   id: string;
+  creator: WebSocket;
+  joiner?: WebSocket;
   createdAt: number;
   lastActivity: number;
   emptySince?: number; // 记录房间开始为空的时间
   participantCount: number; // 当前房间人数
+  creatorInstanceId: string; // 创建者所在实例ID
 }
 
 // 信令消息类型
@@ -18,27 +21,22 @@ interface SignalingMessage {
   error?: string;
 }
 
-// WebSocket 连接管理（每个实例独立）
-const connections = new Map<string, { creator?: WebSocket; joiner?: WebSocket }>();
+// 生成实例ID（用于调试多实例问题）
+const INSTANCE_ID = Math.random().toString(36).substring(7);
+console.log(`🚀 信令服务器实例启动: ${INSTANCE_ID}`);
 
-// 使用 Deno KV 存储房间信息（跨实例共享）
-const kv = await Deno.openKv();
-
+// 存储房间信息
+const rooms = new Map<string, Room>();
 const EMPTY_ROOM_TIMEOUT = 10 * 60 * 1000; // 10分钟空房间超时
 const CLEANUP_INTERVAL = 30 * 1000; // 30秒清理一次过期房间
 
 // 生成6位数字房间号
-async function generateRoomId(): Promise<string> {
+function generateRoomId(): string {
   let roomId: string;
-  let exists = true;
-  
-  while (exists) {
+  do {
     roomId = Math.floor(100000 + Math.random() * 900000).toString();
-    const result = await kv.get(["rooms", roomId]);
-    exists = result.value !== null;
-  }
-  
-  return roomId!;
+  } while (rooms.has(roomId));
+  return roomId;
 }
 
 // 检查房间是否为空
@@ -47,39 +45,26 @@ function isRoomEmpty(room: Room): boolean {
 }
 
 // 更新房间人数
-async function updateRoomParticipantCount(roomId: string) {
-  const conn = connections.get(roomId);
-  if (!conn) return;
-  
+function updateRoomParticipantCount(room: Room) {
   let count = 0;
-  if (conn.creator && conn.creator.readyState === WebSocket.OPEN) {
+  if (room.creator.readyState === WebSocket.OPEN) {
     count++;
   }
-  if (conn.joiner && conn.joiner.readyState === WebSocket.OPEN) {
+  if (room.joiner && room.joiner.readyState === WebSocket.OPEN) {
     count++;
   }
-  
-  const result = await kv.get<Room>(["rooms", roomId]);
-  if (result.value) {
-    const room = result.value;
-    room.participantCount = count;
-    room.lastActivity = Date.now();
-    await kv.set(["rooms", roomId], room);
-    console.log(`房间 ${roomId} 当前人数: ${count}`);
-  }
+  room.participantCount = count;
+  console.log(`[${INSTANCE_ID}] 房间 ${room.id} 当前人数: ${count}`);
 }
 
 // 清理过期房间
-async function cleanupExpiredRooms() {
+function cleanupExpiredRooms() {
   const now = Date.now();
-  const entries = kv.list<Room>({ prefix: ["rooms"] });
-  
-  for await (const entry of entries) {
-    const room = entry.value;
+  for (const [roomId, room] of rooms.entries()) {
     // 只清理已经标记为空的房间
     if (room.emptySince && now - room.emptySince > EMPTY_ROOM_TIMEOUT) {
-      console.log(`清理空房间: ${room.id} (空闲时间: ${Math.floor((now - room.emptySince) / 1000)}秒)`);
-      await kv.delete(entry.key);
+      console.log(`[${INSTANCE_ID}] 清理空房间: ${roomId} (空闲时间: ${Math.floor((now - room.emptySince) / 1000)}秒)`);
+      rooms.delete(roomId);
     }
   }
 }
@@ -88,21 +73,21 @@ async function cleanupExpiredRooms() {
 setInterval(cleanupExpiredRooms, CLEANUP_INTERVAL);
 
 // 处理信令消息
-async function handleSignalingMessage(socket: WebSocket, message: SignalingMessage) {
-  console.log(`📨 收到消息: type=${message.type}, roomId=${message.roomId || 'N/A'}`);
+function handleSignalingMessage(socket: WebSocket, message: SignalingMessage) {
+  console.log(`[${INSTANCE_ID}] 📨 收到消息: type=${message.type}, roomId=${message.roomId || 'N/A'}`);
   
   switch (message.type) {
     case "create_room":
-      console.log(`🏠 处理创建房间请求`);
-      await handleCreateRoom(socket);
+      console.log(`[${INSTANCE_ID}] 🏠 处理创建房间请求`);
+      handleCreateRoom(socket);
       break;
       
     case "join_room":
-      console.log(`🚪 处理加入房间请求: roomId=${message.roomId}`);
+      console.log(`[${INSTANCE_ID}] 🚪 处理加入房间请求: roomId=${message.roomId}`);
       if (message.roomId) {
-        await handleJoinRoom(socket, message.roomId);
+        handleJoinRoom(socket, message.roomId);
       } else {
-        console.error(`❌ 加入房间请求缺少 roomId`);
+        console.error(`[${INSTANCE_ID}] ❌ 加入房间请求缺少 roomId`);
         socket.send(JSON.stringify({
           type: "error",
           error: "缺少房间号"
@@ -112,7 +97,7 @@ async function handleSignalingMessage(socket: WebSocket, message: SignalingMessa
       
     case "webrtc_offer":
       if (message.roomId && message.sdp) {
-        await forwardToPeer(socket, message.roomId, {
+        forwardToPeer(socket, message.roomId, {
           type: "webrtc_offer",
           sdp: message.sdp
         });
@@ -121,7 +106,7 @@ async function handleSignalingMessage(socket: WebSocket, message: SignalingMessa
       
     case "webrtc_answer":
       if (message.roomId && message.sdp) {
-        await forwardToPeer(socket, message.roomId, {
+        forwardToPeer(socket, message.roomId, {
           type: "webrtc_answer", 
           sdp: message.sdp
         });
@@ -130,7 +115,7 @@ async function handleSignalingMessage(socket: WebSocket, message: SignalingMessa
       
     case "ice_candidate":
       if (message.roomId && message.candidate) {
-        await forwardToPeer(socket, message.roomId, {
+        forwardToPeer(socket, message.roomId, {
           type: "ice_candidate",
           candidate: message.candidate
         });
@@ -139,14 +124,9 @@ async function handleSignalingMessage(socket: WebSocket, message: SignalingMessa
       
     case "keepalive":
       // 更新房间活动时间
-      for (const [roomId, conn] of connections.entries()) {
-        if (conn.creator === socket || conn.joiner === socket) {
-          const result = await kv.get<Room>(["rooms", roomId]);
-          if (result.value) {
-            const room = result.value;
-            room.lastActivity = Date.now();
-            await kv.set(["rooms", roomId], room);
-          }
+      for (const room of rooms.values()) {
+        if (room.creator === socket || room.joiner === socket) {
+          room.lastActivity = Date.now();
           break;
         }
       }
@@ -161,23 +141,21 @@ async function handleSignalingMessage(socket: WebSocket, message: SignalingMessa
 }
 
 // 处理创建房间
-async function handleCreateRoom(socket: WebSocket) {
-  const roomId = await generateRoomId();
+function handleCreateRoom(socket: WebSocket) {
+  const roomId = generateRoomId();
   
-  const room: Room = {
+  rooms.set(roomId, {
     id: roomId,
+    creator: socket,
     createdAt: Date.now(),
     lastActivity: Date.now(),
-    participantCount: 1 // 创建者初始人数为1
-  };
+    participantCount: 1,
+    creatorInstanceId: INSTANCE_ID
+  });
   
-  await kv.set(["rooms", roomId], room);
-  
-  // 保存 WebSocket 连接
-  connections.set(roomId, { creator: socket });
-  
-  console.log(`✅ 创建新房间: ${roomId}，当前人数: 1`);
-  console.log(`📊 房间已保存到 KV`);
+  console.log(`[${INSTANCE_ID}] ✅ 创建新房间: ${roomId}，当前人数: 1`);
+  console.log(`[${INSTANCE_ID}] 📊 房间已保存到 Map，当前总房间数: ${rooms.size}`);
+  console.log(`[${INSTANCE_ID}] 📊 所有房间: ${Array.from(rooms.keys()).join(', ')}`);
   
   socket.send(JSON.stringify({
     type: "room_created",
@@ -186,14 +164,16 @@ async function handleCreateRoom(socket: WebSocket) {
 }
 
 // 处理加入房间
-async function handleJoinRoom(socket: WebSocket, roomId: string) {
-  console.log(`📥 收到加入房间请求: ${roomId}`);
+function handleJoinRoom(socket: WebSocket, roomId: string) {
+  console.log(`[${INSTANCE_ID}] 📥 收到加入房间请求: ${roomId}`);
+  console.log(`[${INSTANCE_ID}] 📊 当前房间列表: ${Array.from(rooms.keys()).join(', ')}`);
+  console.log(`[${INSTANCE_ID}] 📊 当前房间总数: ${rooms.size}`);
   
-  const result = await kv.get<Room>(["rooms", roomId]);
-  const room = result.value;
+  const room = rooms.get(roomId);
   
   if (!room) {
-    console.error(`❌ 房间不存在: ${roomId}`);
+    console.error(`[${INSTANCE_ID}] ❌ 房间不存在: ${roomId}`);
+    console.log(`[${INSTANCE_ID}] 📋 可用房间: ${Array.from(rooms.keys()).join(', ') || '无'}`);
     socket.send(JSON.stringify({
       type: "error",
       error: "房间不存在"
@@ -201,12 +181,15 @@ async function handleJoinRoom(socket: WebSocket, roomId: string) {
     return;
   }
   
-  console.log(`✅ 找到房间: ${roomId}`);
+  console.log(`[${INSTANCE_ID}] ✅ 找到房间: ${roomId}`);
+  console.log(`[${INSTANCE_ID}]    - 创建实例: ${room.creatorInstanceId}`);
+  console.log(`[${INSTANCE_ID}]    - 当前实例: ${INSTANCE_ID}`);
+  console.log(`[${INSTANCE_ID}]    - 创建时间: ${new Date(room.createdAt).toISOString()}`);
+  console.log(`[${INSTANCE_ID}]    - 房主状态: ${room.creator.readyState === WebSocket.OPEN ? '在线' : '离线'}`);
+  console.log(`[${INSTANCE_ID}]    - 协助端: ${room.joiner ? '已有' : '空缺'}`);
   
-  // 检查房间是否已满
-  const conn = connections.get(roomId);
-  if (conn && conn.joiner) {
-    console.warn(`⚠️ 房间已满: ${roomId}`);
+  if (room.joiner) {
+    console.warn(`[${INSTANCE_ID}] ⚠️ 房间已满: ${roomId}`);
     socket.send(JSON.stringify({
       type: "error", 
       error: "房间已满"
@@ -215,58 +198,45 @@ async function handleJoinRoom(socket: WebSocket, roomId: string) {
   }
   
   // 将用户添加到房间
-  if (conn) {
-    conn.joiner = socket;
-  } else {
-    connections.set(roomId, { joiner: socket });
-  }
-  
-  // 更新房间信息
+  room.joiner = socket;
   room.lastActivity = Date.now();
   room.emptySince = undefined;
-  room.participantCount = 2;
-  await kv.set(["rooms", roomId], room);
+  updateRoomParticipantCount(room);
   
-  console.log(`✅ 用户成功加入房间: ${roomId}，当前人数: 2`);
+  console.log(`[${INSTANCE_ID}] ✅ 用户成功加入房间: ${roomId}，当前人数: ${room.participantCount}`);
   
   // 通知加入者加入成功
   socket.send(JSON.stringify({
     type: "join_success"
   }));
-  console.log(`📤 已发送加入成功消息给协助端`);
+  console.log(`[${INSTANCE_ID}] 📤 已发送加入成功消息给协助端`);
   
   // 通知房主有用户加入
-  const creator = conn?.creator;
-  if (creator && creator.readyState === WebSocket.OPEN) {
-    creator.send(JSON.stringify({
+  if (room.creator.readyState === WebSocket.OPEN) {
+    room.creator.send(JSON.stringify({
       type: "peer_joined",
-      participantCount: 2
+      participantCount: room.participantCount
     }));
-    console.log(`📤 已发送对等端加入消息给主持端`);
+    console.log(`[${INSTANCE_ID}] 📤 已发送对等端加入消息给主持端`);
   } else {
-    console.log(`⚠️ 主持端连接已关闭，无法通知`);
+    console.log(`[${INSTANCE_ID}] ⚠️ 主持端连接已关闭，无法通知`);
   }
 }
 
 // 转发消息给对等方
-async function forwardToPeer(sender: WebSocket, roomId: string, message: any) {
-  const conn = connections.get(roomId);
-  if (!conn) return;
+function forwardToPeer(sender: WebSocket, roomId: string, message: any) {
+  const room = rooms.get(roomId);
+  if (!room) return;
   
   // 更新房间活动时间
-  const result = await kv.get<Room>(["rooms", roomId]);
-  if (result.value) {
-    const room = result.value;
-    room.lastActivity = Date.now();
-    await kv.set(["rooms", roomId], room);
-  }
+  room.lastActivity = Date.now();
   
   let target: WebSocket | undefined;
   
-  if (sender === conn.creator) {
-    target = conn.joiner;
-  } else if (sender === conn.joiner) {
-    target = conn.creator;
+  if (sender === room.creator) {
+    target = room.joiner;
+  } else if (sender === room.joiner) {
+    target = room.creator;
   }
   
   if (target && target.readyState === WebSocket.OPEN) {
@@ -284,17 +254,17 @@ function handleWebSocket(req: Request): Promise<Response> {
   const { socket, response } = Deno.upgradeWebSocket(req);
 
   socket.onopen = () => {
-    console.log(`🔌 WebSocket 连接已建立`);
+    console.log(`[${INSTANCE_ID}] 🔌 WebSocket 连接已建立 (当前房间数: ${rooms.size})`);
   };
 
-  socket.onmessage = async (event) => {
-    console.log(`📩 收到原始消息: ${event.data}`);
+  socket.onmessage = (event) => {
+    console.log(`[${INSTANCE_ID}] 📩 收到原始消息: ${event.data}`);
     try {
       const message: SignalingMessage = JSON.parse(event.data);
-      console.log(`✅ 消息解析成功: type=${message.type}`);
-      await handleSignalingMessage(socket, message);
+      console.log(`[${INSTANCE_ID}] ✅ 消息解析成功: type=${message.type}`);
+      handleSignalingMessage(socket, message);
     } catch (error) {
-      console.error("消息解析错误:", error);
+      console.error(`[${INSTANCE_ID}] 消息解析错误:`, error);
       socket.send(JSON.stringify({
         type: "error",
         error: "无效的消息格式"
@@ -302,65 +272,55 @@ function handleWebSocket(req: Request): Promise<Response> {
     }
   };
 
-  socket.onclose = async () => {
-    console.log(`🔌 WebSocket 连接已关闭`);
+  socket.onclose = () => {
+    console.log(`[${INSTANCE_ID}] 🔌 WebSocket 连接已关闭 (关闭前房间数: ${rooms.size})`);
     
     // 查找并更新用户所在的房间
-    for (const [roomId, conn] of connections.entries()) {
-      if (conn.creator === socket || conn.joiner === socket) {
-        const result = await kv.get<Room>(["rooms", roomId]);
-        if (!result.value) continue;
-        
-        const room = result.value;
+    for (const [roomId, room] of rooms.entries()) {
+      if (room.creator === socket || room.joiner === socket) {
+        const previousCount = room.participantCount;
         
         // 清除断开用户的引用
-        if (conn.creator === socket) {
-          console.log(`⚠️ 房主断开连接，房间 ${roomId}`);
+        if (room.creator === socket) {
+          console.log(`[${INSTANCE_ID}] ⚠️ 房主断开连接，房间 ${roomId}`);
+          console.log(`[${INSTANCE_ID}] ⏰ 房间将保留，等待房主重新连接或10分钟后过期`);
           
           // 通知协助端房主断开（如果有协助端）
-          if (conn.joiner && conn.joiner.readyState === WebSocket.OPEN) {
-            conn.joiner.send(JSON.stringify({
+          if (room.joiner && room.joiner.readyState === WebSocket.OPEN) {
+            room.joiner.send(JSON.stringify({
               type: "peer_disconnected",
               participantCount: 0
             }));
           }
           
-          // 清除连接
-          conn.creator = undefined;
-          
-          // 更新房间状态
+          // 不立即删除房间，而是标记为空并设置过期时间
           room.emptySince = Date.now();
-          room.participantCount = conn.joiner ? 1 : 0;
-          await kv.set(["rooms", roomId], room);
+          updateRoomParticipantCount(room);
           
-          console.log(`✅ 房间 ${roomId} 已标记为空，将在10分钟后自动清理`);
-        } else if (conn.joiner === socket) {
-          console.log(`⚠️ 协助端断开连接，房间 ${roomId}`);
+          console.log(`[${INSTANCE_ID}] ✅ 房间 ${roomId} 已标记为空，将在10分钟后自动清理`);
+          console.log(`[${INSTANCE_ID}] 📊 当前房间总数: ${rooms.size}`);
+        } else if (room.joiner === socket) {
+          console.log(`[${INSTANCE_ID}] ⚠️ 协助端断开连接，房间 ${roomId}`);
           
           // 清除joiner引用
-          conn.joiner = undefined;
+          room.joiner = undefined;
+          updateRoomParticipantCount(room);
           
-          // 更新房间状态
-          room.participantCount = conn.creator ? 1 : 0;
-          if (room.participantCount === 0) {
-            room.emptySince = Date.now();
-          }
-          await kv.set(["rooms", roomId], room);
+          console.log(`[${INSTANCE_ID}] 用户断开连接，房间 ${roomId} 人数从 ${previousCount} 变为 ${room.participantCount}`);
           
           // 通知房主用户断开连接
-          if (conn.creator && conn.creator.readyState === WebSocket.OPEN) {
-            conn.creator.send(JSON.stringify({
+          if (room.creator.readyState === WebSocket.OPEN) {
+            room.creator.send(JSON.stringify({
               type: "peer_disconnected",
               participantCount: room.participantCount
             }));
           }
           
-          console.log(`房间 ${roomId} 人数变为 ${room.participantCount}`);
-        }
-        
-        // 如果房间完全空了，清理连接
-        if (!conn.creator && !conn.joiner) {
-          connections.delete(roomId);
+          // 检查房间是否为空，如果为空则设置emptySince
+          if (isRoomEmpty(room)) {
+            room.emptySince = Date.now();
+            console.log(`[${INSTANCE_ID}] 房间 ${roomId} 现在为空，将在10分钟后过期`);
+          }
         }
         
         break;
@@ -369,26 +329,21 @@ function handleWebSocket(req: Request): Promise<Response> {
   };
 
   socket.onerror = (error) => {
-    console.error("WebSocket 错误:", error);
+    console.error(`[${INSTANCE_ID}] WebSocket 错误:`, error);
   };
 
   return Promise.resolve(response);
 }
 
 // HTTP 请求处理（用于健康检查）
-async function handleHttp(req: Request): Promise<Response> {
+function handleHttp(req: Request): Response {
   const url = new URL(req.url);
   
   if (url.pathname === "/health") {
-    const entries = kv.list<Room>({ prefix: ["rooms"] });
-    let count = 0;
-    for await (const _ of entries) {
-      count++;
-    }
-    
     return new Response(JSON.stringify({
       status: "ok",
-      roomCount: count,
+      instanceId: INSTANCE_ID,
+      roomCount: rooms.size,
       timestamp: Date.now()
     }), {
       headers: { "Content-Type": "application/json" }
@@ -396,40 +351,36 @@ async function handleHttp(req: Request): Promise<Response> {
   }
   
   if (url.pathname === "/stats") {
-    const roomList: any[] = [];
-    const entries = kv.list<Room>({ prefix: ["rooms"] });
-    
-    for await (const entry of entries) {
-      const room = entry.value;
-      roomList.push({
-        id: room.id,
-        createdAt: room.createdAt,
-        lastActivity: room.lastActivity,
-        participantCount: room.participantCount,
-        isEmpty: isRoomEmpty(room),
-        emptySince: room.emptySince
-      });
-    }
+    const roomList = Array.from(rooms.values()).map(room => ({
+      id: room.id,
+      createdAt: room.createdAt,
+      lastActivity: room.lastActivity,
+      participantCount: room.participantCount,
+      isEmpty: isRoomEmpty(room),
+      emptySince: room.emptySince,
+      creatorInstanceId: room.creatorInstanceId
+    }));
     
     return new Response(JSON.stringify({
+      instanceId: INSTANCE_ID,
       rooms: roomList,
-      totalRooms: roomList.length
+      totalRooms: rooms.size
     }), {
       headers: { "Content-Type": "application/json" }
     });
   }
   
-  return new Response("信令服务器运行中", {
-    headers: { "Content-Type": "text/plain" }
+  return new Response(`信令服务器运行中 (实例: ${INSTANCE_ID})`, {
+    headers: { "Content-Type": "text/plain; charset=utf-8" }
   });
 }
 
 // 主请求处理函数
-export async function handleRequest(req: Request): Promise<Response> {
+export function handleRequest(req: Request): Response {
   if (req.headers.get("upgrade") === "websocket") {
     return handleWebSocket(req) as unknown as Response;
   } else {
-    return await handleHttp(req);
+    return handleHttp(req);
   }
 }
 
